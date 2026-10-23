@@ -2287,7 +2287,16 @@ if ((isset($_POST['unzip']) || isset($_POST['untar'])) && isset($_POST['token'])
             }
         }
         if (strpos($destination, 'mega://') === 0) {
-            mega_unpack_upload($stage, $destination, $uploaded);
+            // Batch mode: keep the MEGA tree cached during the loop (one reload instead of one per file).
+            @ignore_user_abort(true);
+            @set_time_limit(0);
+            MegaApi::$batch = true;
+            try {
+                mega_unpack_upload($stage, $destination, $uploaded);
+            } finally {
+                MegaApi::$batch = false;
+                MegaApi::invalidate();
+            }
         } else {
             fm_local_extract_staged($stage, $destination, $uploaded);
         }
