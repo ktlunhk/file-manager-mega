@@ -1,1 +1,1 @@
-It ia a web file manager which can connect to MEGA Cloud Storage for normal file operation.
+It is a web file manager which can connect to MEGA Cloud Storage for normal file operation.
