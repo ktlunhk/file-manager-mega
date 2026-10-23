@@ -10,6 +10,8 @@ class MegaApi
     public static $master, $sid, $uid, $root, $trash;
     public static $nodes = [], $kids = [], $publicLinks = [];
     private static $loaded = false;
+    /** Batch mode: writes do not wipe the metadata cache; new nodes are registered locally. */
+    public static $batch = false;
 
     /* ---------- crypto helpers ---------- */
 
@@ -287,15 +289,18 @@ class MegaApi
     static function ok($r)
     {
         $success = ($r === 0 || (is_array($r) && !isset($r['e'])));
-        if ($success) self::invalidate();
+        if ($success && !self::$batch) self::invalidate();
         return $success;
     }
 
     static function mkdir($parent, $name)
     {
         $key = random_bytes(16);
-        return self::ok(self::api(['a' => 'p', 't' => $parent, 'n' => [['h' => 'xxxxxxxx', 't' => 1,
-            'a' => self::attr($name, $key), 'k' => self::b64e(self::ecbE($key, self::$master))]]], self::$sid));
+        $r = self::api(['a' => 'p', 't' => $parent, 'n' => [['h' => 'xxxxxxxx', 't' => 1,
+            'a' => self::attr($name, $key), 'k' => self::b64e(self::ecbE($key, self::$master))]]], self::$sid);
+        $ok = self::ok($r);
+        if ($ok && self::$batch) self::registerNode($r, $parent, $name, 1, $key, $key, '', 0);
+        return $ok;
     }
 
     static function quota()
@@ -415,8 +420,22 @@ class MegaApi
         $meta = (substr($fm, 0, 4) ^ substr($fm, 4, 4)) . (substr($fm, 8, 4) ^ substr($fm, 12, 4));
         $nm = $nonce . $meta;
         $key = ($aes ^ $nm) . $nm;
-        return self::ok(self::api(['a' => 'p', 't' => $parent, 'n' => [['h' => $handle, 't' => 0,
-            'a' => self::attr($name, $aes), 'k' => self::b64e(self::ecbE($key, self::$master))]]], self::$sid));
+        $r = self::api(['a' => 'p', 't' => $parent, 'n' => [['h' => $handle, 't' => 0,
+            'a' => self::attr($name, $aes), 'k' => self::b64e(self::ecbE($key, self::$master))]]], self::$sid);
+        $ok = self::ok($r);
+        if ($ok && self::$batch) self::registerNode($r, $parent, $name, 0, $key, $aes, $nonce, $size);
+        return $ok;
+    }
+
+    /** Batch mode only: add a just-created node to the in-memory tree (avoids a full reload). */
+    static function registerNode($r, $parent, $name, $t, $key, $aes, $nonce, $size)
+    {
+        $h = (is_array($r) && isset($r['f'][0]['h'])) ? (string)$r['f'][0]['h'] : '';
+        if ($h === '') { self::invalidate(); return; }   // cannot track it: fall back to a safe reload
+        $name = str_replace('/', '_', (string)$name);
+        self::$nodes[$h] = ['h' => $h, 'p' => $parent, 'n' => $name, 't' => $t, 's' => (int)$size, 'ts' => time(),
+            'key' => $key, 'aes' => $aes, 'nonce' => $nonce, 'rr' => '', 'attrs' => ['n' => $name]];
+        self::$kids[$parent][$name] = $h;
     }
 }
 
