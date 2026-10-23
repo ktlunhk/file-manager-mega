@@ -7,7 +7,7 @@ $storage_type = 'mega'; // 'mega' or 'local'
 
 // Full public application URL for sharing; include the application folder.
 // Keep this above mega_require_login(), which handles public downloads.
-$mega_share_base_url = 'https://aaa/bbb/';
+$mega_share_base_url = 'https://ktlun.me/mega/';
 
 // Successful and failed login audit files are created in this application folder.
 $user_logging_enabled = false; // true to enable; false creates no records
