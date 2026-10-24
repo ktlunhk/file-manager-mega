@@ -11031,10 +11031,11 @@ function fm_mega_link_page() {
       <p class="text-secondary small mt-3"><?php echo lng('Anyone with this link can access the file. Share it carefully.'); ?></p><?php endif; ?>
       <form method="post" class="mt-3" data-mega-operation="share-create"><input type="hidden" name="share_action" value="create"><input type="hidden" name="token" value="<?php echo fm_enc($_SESSION['token'] ?? ''); ?>">
       <?php if (!$link): ?>
-      <div class="fm-unified-actions mega-search-actions mega-shared-link-actions">
-      <?php if (!FM_READONLY): ?><button type="submit" class="btn btn-primary fm-unified-button"><i class="fa fa-link"></i> <?php echo lng('Create Link'); ?></button>
-      <?php if (!$link): ?><button type="button" class="btn btn-outline-danger fm-unified-button" <?php if (!$hasShare): ?>disabled aria-disabled="true"<?php endif; ?> data-handle="<?php echo fm_enc($handle ?? ''); ?>" data-name="<?php echo fm_enc($file); ?>" onclick="megaAskStopSharing(this.dataset.handle,this.dataset.name)"><i class="fa fa-unlink" aria-hidden="true"></i> <?php echo lng('Stop Sharing'); ?></button><?php endif; ?><?php endif; ?></div><?php endif; ?>
+      <div class="fm-unified-actions mega-search-actions mega-shared-link-actions"><a class="btn btn-outline-secondary fm-unified-button" href="?p=<?php echo rawurlencode($folder); ?>"><i class="fa fa-times"></i> <?php echo lng('Cancel'); ?></a>
+      <?php if (!FM_READONLY): ?><button type="submit" class="btn btn-primary fm-unified-button"><i class="fa fa-link"></i> <?php echo lng('Create Link'); ?></button><?php endif; ?></div>
+      <?php else: ?>
       <div class="fm-unified-actions mega-search-actions mega-rubbish-close"><a class="btn btn-outline-secondary fm-unified-button" href="?p=<?php echo rawurlencode($folder); ?>"><i class="fa fa-times"></i> <?php echo lng('Cancel'); ?></a></div>
+      <?php endif; ?>
 </form></div>
     </div></section></main>
 <?php fm_mega_share_dialogs(); fm_show_footer();
