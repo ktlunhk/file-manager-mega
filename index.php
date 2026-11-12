@@ -2664,7 +2664,6 @@ function fm_mega_folder_picker_ui($initialPath, $mode, $copySource = '') {
     <?php
 }
 ?>
-
 <?php
 // Route row-level Copy/Move through the same bulk Copy/Move screen.
 // The row link carries a single source path; the shared form carries the
@@ -5111,6 +5110,102 @@ function fm_get_filesize($size)
 }
 
 /**
+ * List a zip through a ranged reader callable($start,$len) without downloading it:
+ * read the End Of Central Directory at the end of the file, then only the central
+ * directory. Supports ZIP64. Returns the fm_get_zip_info() array format or false.
+ */
+function fm_zip_list_via_ranges($read, $size)
+{
+    try {
+        if ($size < 22) return false;
+        // 1) tail: EOCD (22 bytes + up to 65535 comment) plus room for ZIP64 locator
+        $tailLen = min($size, 65535 + 22 + 20);
+        $tailStart = $size - $tailLen;
+        $tail = $read($tailStart, $tailLen);
+        if ($tail === false || strlen($tail) !== $tailLen) return false;
+        $pos = strrpos($tail, "PK\x05\x06");
+        if ($pos === false) return false;
+        $e = unpack('vdisk/vcddisk/ventries_disk/ventries/Vcdsize/Vcdoffset/vcomment', substr($tail, $pos + 4, 18));
+        $entries = $e['entries'];
+        $cdsize = $e['cdsize'];
+        $cdoffset = $e['cdoffset'];
+
+        // 2) ZIP64
+        if ($entries === 0xFFFF || $cdsize === 0xFFFFFFFF || $cdoffset === 0xFFFFFFFF) {
+            if ($pos < 20 || substr($tail, $pos - 20, 4) !== "PK\x06\x07") return false;
+            $loc = unpack('Vdisk/Poff', substr($tail, $pos - 16, 12));
+            $z64 = $read($loc['off'], 56);
+            if ($z64 === false || strlen($z64) < 56 || substr($z64, 0, 4) !== "PK\x06\x06") return false;
+            $z = unpack('Pentries/Pcdsize/Pcdoffset', substr($z64, 32, 24));
+            $entries = $z['entries'];
+            $cdsize = $z['cdsize'];
+            $cdoffset = $z['cdoffset'];
+        }
+        if ($cdoffset < 0 || $cdsize <= 0 || $cdoffset + $cdsize > $size) return false;
+
+        // 3) central directory (cap how much we read; we only list 1000 entries anyway)
+        $cdRead = min($cdsize, 8 * 1024 * 1024);
+        $cd = $read($cdoffset, $cdRead);
+        if ($cd === false || strlen($cd) !== $cdRead) return false;
+
+        $files = array();
+        $p = 0;
+        $n = strlen($cd);
+        while ($p + 46 <= $n && count($files) < 1000 && substr($cd, $p, 4) === "PK\x01\x02") {
+            $h = unpack('vflags/vmethod/vtime/vdate/Vcrc/Vcsize/Vusize/vnl/vel/vcl', substr($cd, $p + 8, 28));
+            if ($p + 46 + $h['nl'] + $h['el'] + $h['cl'] > $n) break;
+            $name = substr($cd, $p + 46, $h['nl']);
+            $extra = substr($cd, $p + 46 + $h['nl'], $h['el']);
+            $usize = $h['usize'];
+            $csize = $h['csize'];
+            if ($usize === 0xFFFFFFFF || $csize === 0xFFFFFFFF) {
+                $q = 0;
+                while ($q + 4 <= strlen($extra)) {
+                    $hdr = unpack('vid/vlen', substr($extra, $q, 4));
+                    if ($hdr['id'] === 1) {
+                        $d = substr($extra, $q + 4, $hdr['len']);
+                        $o = 0;
+                        if ($usize === 0xFFFFFFFF && strlen($d) >= $o + 8) { $usize = unpack('P', substr($d, $o, 8))[1]; $o += 8; }
+                        if ($csize === 0xFFFFFFFF && strlen($d) >= $o + 8) { $csize = unpack('P', substr($d, $o, 8))[1]; }
+                        break;
+                    }
+                    $q += 4 + $hdr['len'];
+                }
+            }
+            if (!($h['flags'] & 0x800) && !fm_is_utf8($name) && function_exists('mb_convert_encoding')) {
+                $conv = @mb_convert_encoding($name, 'UTF-8', 'CP437');
+                if ($conv !== false && $conv !== '') $name = $conv;
+            }
+            $files[] = array(
+                'name' => $name,
+                'filesize' => (int)$usize,
+                'compressed_size' => (int)$csize,
+                'folder' => substr($name, -1) === '/'
+            );
+            $p += 46 + $h['nl'] + $h['el'] + $h['cl'];
+        }
+        return $files;
+    } catch (Throwable $e) {
+        error_log('Remote zip listing failed: ' . $e->getMessage());
+        return false;
+    }
+}
+
+function fm_get_remote_zip_info($path)
+{
+    try {
+        $node = MegaFS::node($path);
+        if (!$node || (int)$node['t'] !== 0) return false;
+        $read = MegaApi::rangeReader($node['h']);
+        if (!$read) return false;
+        return fm_zip_list_via_ranges($read, (int)$node['s']);
+    } catch (Throwable $e) {
+        error_log('MEGA remote zip listing failed: ' . $e->getMessage());
+        return false;
+    }
+}
+
+/**
  * Get info about zip archive
  * @param string $path
  * @return array|bool
@@ -5122,6 +5217,11 @@ function fm_get_zip_info($path, $ext)
     $local = $path;
     $temp = false;
     if (strpos($path, 'mega://') === 0) {
+        if ($ext === 'zip') {
+            // Fast path: read only the zip central directory with ranged requests.
+            $remote = fm_get_remote_zip_info($path);
+            if ($remote !== false) return $remote;
+        }
         $size = @filesize($path);
         if ($size === false || $size > 64 * 1024 * 1024) return false;
         $temp = @tempnam(sys_get_temp_dir(), 'mega_arc_');
