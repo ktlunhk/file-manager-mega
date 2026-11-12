@@ -379,6 +379,33 @@ class MegaApi
         return true;
     }
 
+    /**
+     * Ranged reader for a remote file: returns callable($start, $len) => decrypted string|false.
+     * MEGA downloads are AES-CTR encrypted and the download URL accepts /<start>-<end>,
+     * so any byte range can be fetched and decrypted without downloading the whole file.
+     */
+    static function rangeReader($h)
+    {
+        $n = self::$nodes[$h] ?? null;
+        if (!$n || $n['t'] !== 0 || (int)$n['s'] <= 0) return false;
+        $r = self::api(['a' => 'g', 'g' => 1, 'n' => $h], self::$sid);
+        if (!is_array($r) || empty($r['g'])) return false;
+        $url = $r['g'];
+        $total = (int)$n['s'];
+        return function ($start, $len) use ($url, $n, $total) {
+            if ($len <= 0) return '';
+            $a = $start & ~15;                       // CTR decryption needs a 16-byte aligned start
+            $end = min($start + $len - 1, $total - 1);
+            $ch = curl_init($url . '/' . $a . '-' . $end);
+            curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => 1, CURLOPT_FOLLOWLOCATION => 1,
+                CURLOPT_CONNECTTIMEOUT => 15, CURLOPT_TIMEOUT => 60]);
+            $d = curl_exec($ch);
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            if ($d === false || ($code != 200 && $code != 206) || strlen($d) !== $end - $a + 1) return false;
+            return substr(self::ctr($d, $n['aes'], $n['nonce'], $a), $start - $a, $end - $start + 1);
+        };
+    }
+
     static function chunks($size)
     {
         $o = 0; $i = 1; $r = [];
