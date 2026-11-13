@@ -346,6 +346,10 @@ class MegaApi
             $ok = self::ok(self::api(['a' => 'a', 'n' => $h, 'attr' => self::attr($newName, $n['aes']),
                 'key' => self::b64e(self::ecbE($n['key'], self::$master)), 'i' => self::b64e(random_bytes(8))], self::$sid));
         }
+        // The move endpoint may succeed without invoking ok(), particularly when
+        // only the parent changes and the filename stays the same. Refresh the
+        // node tree before callers verify the destination/source handles.
+        if ($ok && !self::$batch) self::invalidate();
         return $ok;
     }
 
