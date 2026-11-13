@@ -5,6 +5,9 @@
  */
 $storage_type = 'mega'; // 'mega' or 'local'
 
+// PHP error reporting: false hides PHP errors on the page, true shows them (for debugging).
+$error_reporting = false;
+
 // Full public application URL for sharing; include the application folder.
 // Keep this above mega_require_login(), which handles public downloads.
 $mega_share_base_url = 'https://ktlun.me/mega/';
