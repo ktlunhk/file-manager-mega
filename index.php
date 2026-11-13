@@ -1447,7 +1447,18 @@ if (isset($_POST['file'], $_POST['copy_to'], $_POST['finish'], $_POST['token']) 
                 $from = $path . '/' . $f;
                 // abs path to
                 $dest = $copy_to_path . '/' . $f;
-                if (!file_exists($from)) {
+                $sourceExists = file_exists($from);
+                if (!$sourceExists && strpos($from, 'mega://') === 0) {
+                    try {
+                        MegaApi::load();
+                        $remoteSource = MegaFS::remote($from);
+                        $sourceHandle = $remoteSource === false ? null : MegaApi::find($remoteSource);
+                        $sourceExists = $sourceHandle !== null && isset(MegaApi::$nodes[$sourceHandle]);
+                    } catch (Throwable $e) {
+                        error_log('MEGA bulk source validation: ' . $e->getMessage());
+                    }
+                }
+                if (!$sourceExists) {
                     $errors++;
                     continue;
                 }
@@ -1955,6 +1966,47 @@ if (isset($_POST['group'], $_POST['delete'], $_POST['token']) && !FM_READONLY) {
 
     $FM_PATH = FM_PATH;
     fm_redirect(FM_SELF_URL . '?p=' . urlencode($FM_PATH));
+}
+
+// Download selected entries without creating a new archive in cloud storage.
+// A single regular file uses the existing authenticated download action instead.
+if (isset($_POST['mega_selection_download'], $_POST['token'])) {
+    if (!verifyToken($_POST['token'])) { http_response_code(403); exit('Invalid token'); }
+    $files = isset($_POST['file']) && is_array($_POST['file']) ? $_POST['file'] : array();
+    if (!$files || count($files) > 1000 || !class_exists('ZipArchive')) { http_response_code(400); exit('Invalid selection or ZIP unavailable'); }
+    $base = rtrim(FM_ROOT_PATH, '/');
+    if (FM_PATH !== '') $base .= '/' . FM_PATH;
+    $stage = sys_get_temp_dir() . '/mega_download_' . bin2hex(random_bytes(12));
+    if (!@mkdir($stage, 0700)) { http_response_code(500); exit('Cannot create temporary directory'); }
+    try {
+        $names = array();
+        foreach ($files as $item) {
+            if (!is_string($item) || $item === '' || $item === '.' || $item === '..' || basename($item) !== $item || strpos($item, '/') !== false || strpos($item, "\\") !== false || strpos($item, "\0") !== false) throw new RuntimeException('Invalid file name');
+            $names[$item] = true;
+        }
+        $names = array_keys($names);
+        $count = 0; $bytes = 0;
+        foreach ($names as $name) mega_archive_stage_item($base . '/' . $name, $stage . '/' . $name, $count, $bytes, 0);
+        $archivePath = $stage . '/download.zip';
+        $zip = new ZipArchive();
+        if ($zip->open($archivePath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) throw new RuntimeException('Cannot create ZIP');
+        $ok = true;
+        foreach ($names as $name) if (!mega_archive_add_zip($zip, $stage . '/' . $name, $name)) { $ok = false; break; }
+        $closed = $zip->close();
+        if (!$ok || !$closed || !is_file($archivePath)) throw new RuntimeException('Cannot finish ZIP');
+        $downloadName = (count($names) === 1 ? $names[0] : 'selected_files') . '.zip';
+        while (ob_get_level()) ob_end_clean();
+        header('Content-Type: application/zip');
+        header('Content-Disposition: attachment; filename="download.zip"; filename*=UTF-8\'\'' . rawurlencode($downloadName));
+        header('Content-Length: ' . filesize($archivePath));
+        header('Cache-Control: private, no-store');
+        readfile($archivePath);
+    } catch (Throwable $e) {
+        error_log('MEGA selection download failed: ' . $e->getMessage());
+        if (!headers_sent()) http_response_code(500);
+        echo 'Unable to prepare ZIP: ' . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8');
+    } finally { mega_archive_remove_temp($stage); }
+    exit;
 }
 
 // Pack files zip, tar. MEGA is a remote stream wrapper, so ZipArchive and
@@ -2691,8 +2743,32 @@ function fm_mega_folder_picker_ui($initialPath, $mode, $copySource = '') {
 if (isset($_GET['copy']) && !isset($_GET['finish']) && !FM_READONLY) {
     $megaSingleSource = fm_clean_path($_GET['copy']);
     $megaSingleParent = trim(dirname($megaSingleSource), './');
-    if ($megaSingleSource === '' || $megaSingleParent !== trim(FM_PATH, '/') ||
-        !file_exists(rtrim(FM_ROOT_PATH, '/') . '/' . $megaSingleSource)) {
+    // Older folder action links passed p= (root) even for nested folders.
+    // Restore the actual source parent before building the selection form.
+    // This also supports bookmarked links created by earlier releases.
+    if ($megaSingleSource !== '' && $megaSingleParent !== trim(FM_PATH, '/')) {
+        fm_redirect(FM_SELF_URL . '?p=' . urlencode($megaSingleParent) . '&copy=' . urlencode($megaSingleSource));
+        exit;
+    }
+    // A MEGA path is a virtual stream path. PHP file_exists() may return false
+    // for valid nested nodes, so verify the node through MEGA's loaded tree.
+    $megaSingleExists = false;
+    if ($megaSingleSource !== '' && $megaSingleParent === trim(FM_PATH, '/')) {
+        $megaSingleFullPath = rtrim(FM_ROOT_PATH, '/') . '/' . $megaSingleSource;
+        if (strpos($megaSingleFullPath, 'mega://') === 0) {
+            try {
+                MegaApi::load();
+                $megaSingleRemote = MegaFS::remote($megaSingleFullPath);
+                $megaSingleHandle = $megaSingleRemote === false ? null : MegaApi::find($megaSingleRemote);
+                $megaSingleExists = $megaSingleHandle !== null && isset(MegaApi::$nodes[$megaSingleHandle]);
+            } catch (Throwable $e) {
+                error_log('MEGA Copy/Move source validation: ' . $e->getMessage());
+            }
+        } else {
+            $megaSingleExists = file_exists($megaSingleFullPath);
+        }
+    }
+    if (!$megaSingleExists) {
         fm_set_msg(lng('File not found'), 'error');
         fm_redirect(FM_SELF_URL . '?p=' . urlencode(FM_PATH));
     }
@@ -2771,8 +2847,8 @@ if (isset($_POST['copy']) && !FM_READONLY) {
                       <details class="mega-copy-v43-advanced"><summary><?php echo lng('DestinationFolder'); ?> · <?php echo lng('Edit'); ?></summary><div id="mega-copy-v43-manual"></div></details>
                       <div class="mega-copy-v43-actions">
                         <a href="?p=<?php echo urlencode(FM_PATH); ?>" id="mega-copy-v100-cancel" class="btn btn-outline-secondary mega-copy-v43-cancel"><i class="fa fa-times" aria-hidden="true"></i> <?php echo lng('Cancel'); ?></a>
-                        <button type="button" id="mega-copy-v43-move" class="btn btn-success"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 10h8"/><path d="m16 6 4 4-4 4"/><path d="M20 10V5a2 2 0 0 0-2-2H8l-2 3H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3"/></svg> <?php echo lng('Move'); ?></button>
                         <button type="button" id="mega-copy-v43-copy" class="btn btn-primary"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg> <?php echo lng('Copy'); ?></button>
+                        <button type="button" id="mega-copy-v43-move" class="btn btn-success"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 10h8"/><path d="m16 6 4 4-4 4"/><path d="M20 10V5a2 2 0 0 0-2-2H8l-2 3H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3"/></svg> <?php echo lng('Move'); ?></button>
                       </div>
                     </section>
                     <style id="mega-copy-v43-style">
@@ -4054,7 +4130,7 @@ $all_files_size = 0;
                     <td class="inline-actions"><?php if (!FM_READONLY): ?>
                             <a title="<?php echo lng('Delete') ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;del=<?php echo urlencode($f) ?>" onclick="confirmDialog(event, '1028','<?php echo lng('Delete') . ' ' . lng('Folder'); ?>','<?php echo urlencode($f) ?>', this.href);"> <i class="fa fa-trash-o" aria-hidden="true"></i></a>
                             <a title="<?php echo lng('Rename') ?>" href="#" onclick="rename('<?php echo fm_enc(addslashes(FM_PATH)) ?>', '<?php echo fm_enc(addslashes($f)) ?>');return false;"><i class="fa fa-pencil-square-o" aria-hidden="true"></i></a>
-                            <a title="<?php echo lng('CopyTo') ?>..." href="?p=&amp;copy=<?php echo urlencode(trim(FM_PATH . '/' . $f, '/')) ?>"><i class="fa fa-files-o" aria-hidden="true"></i></a>
+                            <a title="<?php echo lng('CopyTo') ?>..." href="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo urlencode(trim(FM_PATH . '/' . $f, '/')) ?>"><i class="fa fa-files-o" aria-hidden="true"></i></a>
                         <?php endif; ?>
                     </td>
                 </tr>
@@ -4431,7 +4507,7 @@ $all_files_size = 0;
         button.setAttribute('aria-label',<?php echo json_encode(lng('Actions')); ?>);
         button.setAttribute('aria-expanded','false');
         var menu=document.createElement('div');menu.className='mega-row-actions-menu';
-        links.forEach(function(link){var clone=link.cloneNode(true);clone.removeAttribute('id');var label=link.getAttribute('title')||link.textContent.trim();clone.appendChild(document.createTextNode(' '+label));menu.appendChild(clone);});
+        links.forEach(function(link){var clone=link.cloneNode(true);clone.removeAttribute('id');var label=link.getAttribute('title')||link.textContent.trim();if(/copy to/i.test(label))label='Copy/Move';clone.appendChild(document.createTextNode(' '+label));menu.appendChild(clone);});
         // Use the same download action in both layouts. A nested form inside
         // the bulk-action form is invalid HTML and may be moved by the browser.
         var downloadButton=actionCell.querySelector('button.mega-download-direct');
@@ -4441,6 +4517,15 @@ $all_files_size = 0;
           downloadClone.removeAttribute('id');
           downloadClone.appendChild(document.createTextNode(' '+(downloadButton.getAttribute('title')||<?php echo json_encode(lng('Download')); ?>)));
           menu.appendChild(downloadClone);
+        }
+        // Folder rows have no direct file endpoint; download them through the
+        // existing ZIP staging endpoint, without modifying checkbox selection.
+        if(!downloadButton && row.querySelector('input[name="file[]"]')){
+          var folderDownload=document.createElement('button');
+          folderDownload.type='button';folderDownload.className='mega-menu-download mega-folder-download';
+          folderDownload.innerHTML='<i class="fa fa-download" aria-hidden="true"></i>';
+          folderDownload.appendChild(document.createTextNode(' '+<?php echo json_encode(lng('Download')); ?>));
+          menu.appendChild(folderDownload);
         }
         // Single-item ZIP/TAR actions reuse the existing authenticated bulk
         // archive endpoint without altering any checked files or folders.
@@ -4498,6 +4583,50 @@ $all_files_size = 0;
       document.body.appendChild(request);
       request.submit();
     }, file.value);
+  });
+  // ZIP downloads are prepared on the server. Keep the existing working dialog
+  // visible until the archive response has actually arrived (or failed).
+  window.megaSubmitArchiveDownload = async function(form) {
+    if (window.megaArchiveDownloadBusy) return;
+    window.megaArchiveDownloadBusy = true;
+    if (window.megaShowWorking) window.megaShowWorking('zip');
+    try {
+      // Allow the overlay to paint before the request begins.
+      await new Promise(function(resolve){ requestAnimationFrame(function(){requestAnimationFrame(resolve);}); });
+      var response = await fetch(form.action, {method:'POST', body:new FormData(form), credentials:'same-origin'});
+      if (!response.ok) throw new Error((await response.text()).slice(0,300) || 'ZIP download failed');
+      var contentType = response.headers.get('Content-Type') || '';
+      if (contentType.indexOf('application/zip') === -1) throw new Error('Server did not return a ZIP archive');
+      var disposition = response.headers.get('Content-Disposition') || '';
+      var match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+      var filename = match ? decodeURIComponent(match[1].trim()) : 'download.zip';
+      var blob = await response.blob();
+      var url = URL.createObjectURL(blob);
+      var anchor = document.createElement('a');anchor.href=url;anchor.download=filename;
+      document.body.appendChild(anchor);anchor.click();anchor.remove();
+      setTimeout(function(){URL.revokeObjectURL(url);},60000);
+    } catch(error) {
+      alert('Unable to download ZIP: ' + (error && error.message ? error.message : error));
+    } finally {
+      if(window.megaHideWorking)window.megaHideWorking();
+      window.megaArchiveDownloadBusy = false;
+      if(form.parentNode)form.remove();
+    }
+  };
+  document.addEventListener('click',function(e){
+    var trigger=e.target.closest('button.mega-folder-download');
+    if(!trigger)return;
+    e.preventDefault();e.stopPropagation();
+    var row=trigger.closest('tr'),item=row&&row.querySelector('input[name="file[]"]');
+    var bulk=item&&item.form;if(!bulk)return;
+    if(window.megaCloseRowMenus)window.megaCloseRowMenus();
+    var request=document.createElement('form');request.method='post';
+    request.action=bulk.action||location.href;request.style.display='none';
+    request.setAttribute('data-no-processing','download');
+    function add(k,v){var i=document.createElement('input');i.type='hidden';i.name=k;i.value=v;request.appendChild(i);}
+    add('mega_selection_download','1');add('file[]',item.value);
+    ['token','p'].forEach(function(k){var i=bulk.querySelector('input[name="'+k+'"]');if(i)add(k,i.value);});
+    document.body.appendChild(request);window.megaSubmitArchiveDownload(request);
   });
   // Download POST must not be nested in the bulk form. Create a temporary
   // standalone form at click time to preserve the existing download endpoint.
@@ -6591,6 +6720,52 @@ function fm_show_nav_path($path)
       if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
     })();
     </script>
+    <style id="mega-mobile-menu-unified-v2">
+    @media<?php echo fm_layout_media_query(); ?>{
+      html body .mega-mobile-menu:not([hidden]){width:min(270px,calc(100vw - 24px))!important;max-height:calc(100dvh - 155px)!important;overflow-y:auto!important;padding:5px 7px!important;gap:0!important}
+      html body .mega-mobile-menu a,html body .mega-mobile-menu button,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu a,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu button{
+        font-size:16px!important;line-height:1.2!important;min-height:36px!important;
+        padding:6px 10px!important;margin:0!important;gap:10px!important;
+      }
+      html body .mega-mobile-menu .mega-mobile-selection-label{font-size:14px!important;padding:4px 10px!important;line-height:1.2!important}
+      html body .mega-mobile-menu hr{margin:3px 7px!important}
+      html body.mega-mobile-list #main-table .mega-row-actions-menu .mega-menu-download,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu .mega-row-archive-action{min-height:36px!important;padding:6px 10px!important;font-size:16px!important}
+      html body .mega-mobile-menu .mega-mobile-selected-actions{margin:0!important;padding:0!important}
+    }
+    </style>
+    <style id="mega-mobile-popup-consistency-v3">
+    @media <?php echo fm_layout_media_query(); ?> {
+      html body .mega-mobile-menu a,html body .mega-mobile-menu button,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu > a,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu > button {
+        display:flex!important;align-items:center!important;justify-content:flex-start!important;
+        box-sizing:border-box!important;width:100%!important;min-height:38px!important;
+        padding:7px 12px!important;margin:0!important;gap:12px!important;
+        font-family:inherit!important;font-size:16px!important;font-weight:400!important;
+        line-height:24px!important;text-align:left!important;white-space:nowrap!important;
+        border:0!important;border-radius:5px!important;background:transparent!important;
+        color:var(--bs-body-color,#222)!important;box-shadow:none!important;
+      }
+      html body .mega-mobile-menu a > i,html body .mega-mobile-menu button > i,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu > a > i,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu > button > i {
+        display:inline-flex!important;align-items:center!important;justify-content:center!important;
+        flex:0 0 22px!important;width:22px!important;min-width:22px!important;
+        height:24px!important;margin:0!important;padding:0!important;
+        font-size:18px!important;line-height:24px!important;text-align:center!important;
+        color:inherit!important;background:transparent!important;
+      }
+      html body .mega-mobile-menu a:hover,html body .mega-mobile-menu button:hover,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu > a:hover,
+      html body.mega-mobile-list #main-table .mega-row-actions-menu > button:hover {
+        background:var(--bs-secondary-bg,#e8edf2)!important;
+      }
+      html body .mega-mobile-menu:not([hidden]) {max-height:calc(100dvh - 130px)!important;}
+    }
+    </style>
     <!-- Mobile-only compact header and contextual hamburger menu. -->
     <div class="mega-mobile-header-spacer" aria-hidden="true"></div>
     <div class="mega-mobile-header" aria-label="Current folder and actions">
@@ -6600,6 +6775,7 @@ function fm_show_nav_path($path)
       <div class="mega-mobile-menu" id="mega-mobile-menu" hidden>
         <div class="mega-mobile-selected-actions" hidden>
           <div class="mega-mobile-selection-label"><?php echo lng('Selected count placeholder'); ?></div>
+          <button type="button" data-bulk="download"><i class="fa fa-download"></i> <?php echo lng('Download'); ?></button>
           <button type="button" data-bulk="copy"><i class="fa fa-files-o"></i> <?php echo lng('Copy/Move'); ?></button>
           <button type="button" data-bulk="delete"><i class="fa fa-trash-o"></i> <?php echo lng('Delete'); ?></button>
           <button type="button" data-bulk="zip"><i class="fa fa-file-archive-o"></i> <?php echo lng('Create ZIP'); ?></button>
@@ -6640,7 +6816,26 @@ function fm_show_nav_path($path)
       trigger.addEventListener('click',function(e){e.stopPropagation();var opening=panel.hidden;panel.hidden=!opening;trigger.setAttribute('aria-expanded',String(opening));});
       document.addEventListener('click',function(e){if(!panel.hidden&&!panel.contains(e.target)&&!trigger.contains(e.target))close()});
       document.addEventListener('keydown',function(e){if(e.key==='Escape')close()});
-      panel.addEventListener('click',function(e){var button=e.target.closest('[data-bulk]');if(!button)return;var op=button.getAttribute('data-bulk');close();if(op==='copy'){var copy=document.getElementById('a-copy');if(copy)copy.click();}else if(typeof megaConfirmBulk==='function')megaConfirmBulk(op);});
+      panel.addEventListener('click',function(e){var button=e.target.closest('[data-bulk]');if(!button)return;var op=button.getAttribute('data-bulk');close();if(op==='download'){window.megaDownloadSelection();}else if(op==='copy'){var copy=document.getElementById('a-copy');if(copy)copy.click();}else if(typeof megaConfirmBulk==='function')megaConfirmBulk(op);});
+      window.megaDownloadSelection=function(){
+        var bulk=document.querySelector('#main-table input[name="file[]"]')?.form;
+        if(!bulk)return;
+        var selected=Array.prototype.slice.call(bulk.querySelectorAll('input[name="file[]"]:checked'));
+        if(!selected.length)return;
+        // A single file can use its native endpoint (no server-side ZIP needed).
+        if(selected.length===1){
+          var row=selected[0].closest('tr');
+          var nativeDownload=row&&row.querySelector('.mega-download-direct');
+          if(nativeDownload){nativeDownload.click();return;}
+        }
+        var form=document.createElement('form');form.method='post';form.action=bulk.action||location.href;
+        form.style.display='none';form.setAttribute('data-no-processing','download');
+        function add(k,v){var input=document.createElement('input');input.type='hidden';input.name=k;input.value=v;form.appendChild(input);}
+        add('mega_selection_download','1');
+        selected.forEach(function(input){add('file[]',input.value);});
+        ['token','p'].forEach(function(k){var input=bulk.querySelector('input[name="'+k+'"]');if(input)add(k,input.value);});
+        document.body.appendChild(form);window.megaSubmitArchiveDownload(form);
+      };
       window.megaMobileUpdateMenu=function(count){var selected=panel.querySelector('.mega-mobile-selected-actions');if(selected){selected.hidden=count===0;selected.querySelector('.mega-mobile-selection-label').textContent=count+' '+<?php echo json_encode(html_entity_decode(lng('selected'), ENT_QUOTES, 'UTF-8'), JSON_UNESCAPED_UNICODE | JSON_HEX_TAG); ?>;}};
     })();
     </script>
