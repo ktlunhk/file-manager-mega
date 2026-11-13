@@ -6622,6 +6622,21 @@ function fm_show_nav_path($path)
       var trigger=document.querySelector('.mega-mobile-menu-trigger'),panel=document.getElementById('mega-mobile-menu');
       if(!trigger||!panel)return;
       function close(){panel.hidden=true;trigger.setAttribute('aria-expanded','false')}
+      // Keep the header menu and per-file action menus mutually exclusive.
+      // Capture phase closes the other menu before its own click handler opens this one.
+      document.addEventListener('click',function(e){
+        var rowToggle=e.target.closest('.mega-row-more,.mega-trash-more');
+        var headerToggle=e.target.closest('.mega-mobile-menu-trigger');
+        if(rowToggle){close();}
+        if(headerToggle){
+          if(window.megaCloseRowMenus)window.megaCloseRowMenus();
+          document.querySelectorAll('.mega-trash-row-actions.mega-open').forEach(function(menu){
+            menu.classList.remove('mega-open');
+            var toggle=menu.previousElementSibling;
+            if(toggle)toggle.setAttribute('aria-expanded','false');
+          });
+        }
+      },true);
       trigger.addEventListener('click',function(e){e.stopPropagation();var opening=panel.hidden;panel.hidden=!opening;trigger.setAttribute('aria-expanded',String(opening));});
       document.addEventListener('click',function(e){if(!panel.hidden&&!panel.contains(e.target)&&!trigger.contains(e.target))close()});
       document.addEventListener('keydown',function(e){if(e.key==='Escape')close()});
